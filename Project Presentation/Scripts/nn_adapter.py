@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from typing import Dict, Tuple, List, Iterable, Optional, Any
 
-from model2 import PolicyValueNet
+from model import PolicyValueNet
 # If you put the encoder in a module, prefer importing it:
 # from encoder import encode_env as encode_env_torch
 # For a self-contained adapter, we keep a small local encoder replica:
