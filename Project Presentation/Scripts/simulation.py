@@ -37,9 +37,11 @@ from tqdm import tqdm
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-# Import environment and MCTS agent
+# Import environment, MCTS agent, state encoder and NN Adapter
 from environment import ChessEnv
 from agent import MCTSAgent, SearchConfig
+from encoder import encode_env_np as encode_state
+from adapter import PVWrapper
 
 # ---------- Windows / notebook safety ----------
 import multiprocessing as mp
@@ -99,7 +101,7 @@ def tau_schedule_explore(ply: int) -> float:
     return _TAU_POINTS[-1][1]
 
 EXPLORE_POLICY_EPS = 0.01
-# EXPLORE root Dirichlet schedule (matches the figure):
+# EXPLORE root Dirichlet schedule:
 # hold cycles 1–3 at high noise; linearly decay to cycle 12; flat afterward.
 DIRI_ALPHA_START = 0.30
 DIRI_ALPHA_END   = 0.10
@@ -129,9 +131,9 @@ BOOK_PLIES: int = 8           # number of half-moves we try to guide
 BOOK_PROB: float = 0.7        # chance to use a book on a given game
 
 # -------------------- Arena speed knobs --------------------
-OPEN_POLICY_PLIES_ARENA   = 0      # CHANGED: was 20
+OPEN_POLICY_PLIES_ARENA   = 0
 ARENA_MAX_PLIES           = 160
-ARENA_QUICKDRAW_HALFMOVES = 100    # CHANGED: was 60
+ARENA_QUICKDRAW_HALFMOVES = 100
 
 # -------------------- Quickdraw (EXPLORE/EVAL) --------------------
 EXPLORE_QUICKDRAW_HALFMOVES = 80
@@ -182,13 +184,13 @@ LR           = 1e-3
 WEIGHT_DECAY = 1e-4
 VALUE_LOSS_WEIGHT = 1.0
 GRAD_CLIP_NORM = 1.0
-WARMUP_FRAC = 0.08  # 5% warmup
+WARMUP_FRAC = 0.08
 EMA_DECAY = 0.999
 
 # Cap how many (state,π,z) we keep per game to avoid long shuffles dominating
 MAX_SAMPLES_PER_GAME = 192
 
-# >>> NEW: small replay buffer for training
+# Small replay buffer for training
 REPLAY_K = 8
 
 # -------------------- Draw penalty / label smoothing --------------------
@@ -198,7 +200,7 @@ def get_draw_penalty(cycle: int) -> float:
 DRAW_PENALTY = get_draw_penalty(CURRENT_CYCLE)  # initialize for import-time use
 POLICY_SMOOTH_EPS = 0.03  # label smoothing over legal moves
 
-# --- NEW: augmentation / prioritization toggles ---
+# Augmentation / prioritization toggles ---
 AUGMENT_SYMMETRY = False           # (disabled here; enabling requires remapping PF/PD)
 COLOR_FLIP_AUG   = False           # (disabled here; enabling requires remapping PF/PD)
 PRIORITIZED_LOSS = True            # keep on; we'll wire it into _train_on_npz
@@ -317,7 +319,7 @@ CFG_ARENA = SearchConfig(
     repeat_penalty_at_root=0.10
 )
 
-# --- live_log.py (fixed & VS Code friendly) --------------------
+# --- live_log.py --------------------
 from pathlib import Path
 import sys, atexit, faulthandler
 
@@ -396,7 +398,7 @@ def setup_live_log(logdir="logs", prefix="run", fsync_every=200):
 
 # -------------------- Move indexing (64x64) --------------------
 Move = Tuple[int, int, int, int]
-# --- NEW: 64×73 factoring (from-square × 73 deltas) ---
+# 64×73 factoring (from-square × 73 deltas) ---
 DELTA73: List[Tuple[int,int]] = []
 # 56 queen-like deltas (N,E,S,W, diagonals) with up to 7 steps
 for dr, dc in [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]:
@@ -440,48 +442,6 @@ def index_to_move(idx: int) -> Tuple[int,int,int,int]:
     fr, fc = divmod(frfc, 8)
     tr, tc = divmod(trtc, 8)
     return (fr, fc, tr, tc)
-
-# --------------------- State encoder (18 planes) ---------------------
-def encode_state(env: ChessEnv) -> np.ndarray:
-    """
-    [18,8,8] float32:
-      0..5 :  white P,N,B,R,Q,K
-      6..11:  black P,N,B,R,Q,K
-      12   :  side-to-move (1 for white else 0)
-      13..16: castling rights (wK,wQ,bK,bQ) replicated
-      17   :  en-passant file (1 on that file, else 0)
-    """
-    board = np.asarray(env.board, dtype=np.int8)         # [8,8]
-    x = np.zeros((18, 8, 8), dtype=np.float32)
-
-    # piece planes
-    for ap, plane_w, plane_b in [(1,0,6),(2,1,7),(3,2,8),(4,3,9),(5,4,10),(6,5,11)]:
-        x[plane_w][board ==  ap] = 1.0
-        x[plane_b][board == -ap] = 1.0
-
-    # side to move
-    x[12, :, :] = 1.0 if env.current_player == 1 else 0.0
-
-    # castling rights -> planes 13..16 (FOUR planes)
-    wk = wq = bk = bq = False
-    cr = getattr(env, "castling_rights", None)
-    if isinstance(cr, dict):
-        wk = bool(cr.get("K", False))
-        wq = bool(cr.get("Q", False))
-        bk = bool(cr.get("k", False))
-        bq = bool(cr.get("q", False))
-    x[13:17] = np.array(
-        [1.0 if wk else 0.0, 1.0 if wq else 0.0, 1.0 if bk else 0.0, 1.0 if bq else 0.0],
-        dtype=np.float32
-    )[:, None, None]
-
-    # en passant file -> plane 17
-    ep = getattr(env, "en_passant_square", None)
-    if ep:
-        _, file_c = ep
-        if 0 <= file_c < 8:
-            x[17, :, file_c] = 1.0
-    return x
 
 # --------------------- Tactical helpers (push/pop only) ---------------------
 def _exists_mate_in_one(env: ChessEnv) -> bool:
@@ -1203,62 +1163,41 @@ def build_backend(use_net: bool,
 
     import torch
     from model import PolicyValueNetFactored as PolicyValueNet
-    _local = {"net": None, "dtype": None, "device": None}
-    def _ensure():
-        if _local["net"] is None:
-            net = PolicyValueNet().to(net_device)
-            sd = torch.load(net_weights_path, map_location=net_device)
-            net.load_state_dict(sd)
-            use_half = _effective_fp16(net_device)
-            net = net.half() if use_half else net.float()
-            net.eval()
-            _local["net"] = net
-            _local["dtype"] = torch.float16 if use_half else torch.float32
-            _local["device"] = net_device
+
+    # Load the net once
+    net = PolicyValueNet().to(net_device)
+    sd = torch.load(net_weights_path, map_location=net_device)
+    net.load_state_dict(sd)
+    use_half = _effective_fp16(net_device)
+    net = net.half() if use_half else net.float()
+    net.eval()
+
+    # Wrap with your adapter (it handles encoding/masks/batching)
+    adapter = PVWrapper(net, device=net_device)
 
     def pol(env: ChessEnv):
-        import torch
-        _ensure()
-        legal = env.legal_moves()
-        if not legal:
-            return {}
-        x = encode_state(env)
-        with torch.no_grad():
-            xt = torch.as_tensor(x[None, ...], dtype=_local["dtype"], device=_local["device"])
-            from_logits, delta_logits, _ = _local["net"](xt)
-            from_logits  = from_logits.float().cpu().numpy()[0]      # [64]
-            delta_logits = delta_logits.float().cpu().numpy()[0]     # [64,73]
-        pairs = [move_to_pair(*m) for m in legal]
-        # Optional safety: mask out forbidden (from, delta) if env provides masks
-        try:
-            if hasattr(env, "masks_factored"):
-                from_mask, delta_mask = env.masks_factored()  # [64], [64,73]
-                filtered = []
-                kept_moves = []
-                for mv, (f, d) in zip(legal, pairs):
-                    if from_mask[f] and delta_mask[f, d]:
-                        filtered.append((f, d))
-                        kept_moves.append(mv)
-                if filtered:
-                    pairs, legal = filtered, kept_moves
-        except Exception:
-            pass
-        ll = np.array([from_logits[f] + delta_logits[f, d] for (f,d) in pairs], dtype=np.float32)
-        ll -= ll.max()
-        probs = np.exp(ll); probs = probs / (probs.sum() + 1e-12)
-        return {m: float(p) for m, p in zip(legal, probs)}
+        # Adapter returns Dict[Move, float]
+        return adapter.policy(env)
+
+    # Expose factored head so MCTSAgent takes the fast path
+    pol.policy_factored = adapter.policy_factored
 
     def val(env: ChessEnv, perspective: int):
-        import torch
-        _ensure()
-        x = encode_state(env)
-        with torch.no_grad():
-            xt = torch.as_tensor(x[None, ...], dtype=_local["dtype"], device=_local["device"])
-            _, _, v = _local["net"](xt)
-            v = float(v.float().cpu().numpy().reshape(-1)[0])
-        return v if perspective == 1 else -v
+        # Adapter is callable: __call__(env, perspective) -> float in [-1, 1]
+        return adapter(env, perspective)
+
+    # Let MCTSAgent auto-detect batching/features hooks
+    if hasattr(adapter, "preferred_batch"):
+        val.preferred_batch = adapter.preferred_batch
+    if hasattr(adapter, "value_many"):
+        val.value_many = adapter.value_many
+    if hasattr(adapter, "value_many_features"):
+        val.value_many_features = adapter.value_many_features
+    if hasattr(adapter, "features_from_env"):
+        val.features_from_env = adapter.features_from_env
 
     return pol, val
+
 
 # -------------------- Targets (Z) with state-aware draws --------------------
 def compute_z_labels(info: Dict[str, str],
@@ -1336,14 +1275,13 @@ def _atomic_savez_fast(path: str, **arrays):
 
 # ---------------------- Opening book (tiny) ----------------------
 def _uci_to_move(uci: str) -> Move:
-    # uci like "e2e4" or "g1f3"; we ignore promotions (auto-queen already in env)
+    # uci like "e2e4" or "g1f3";
     f_file, f_rank, t_file, t_rank = uci[0], uci[1], uci[2], uci[3]
     fc = FILES.index(f_file); fr = int(f_rank) - 1
     tc = FILES.index(t_file); tr = int(t_rank) - 1
     # env uses rows 0..7 with white pawns at row=1 (rank 2) and WHITE moves "down" (+r)
     return (fr, fc, tr, tc)
 
-# A few short skeletons (8 plies max). Feel free to extend.
 _OPENING_BOOK_UCI: List[List[str]] = [
     # ----- Open Games -----
     # Italian (Giuoco Piano)
@@ -1387,7 +1325,7 @@ _OPENING_BOOK_UCI: List[List[str]] = [
     # Pirc
     ["e2e4","d7d6","d2d4","g8f6","b1c3","g7g6","g1f3","f8g7"],
 
-    # ----- Closed (d4) -----
+    # ----- Closed Games(d4) -----
     # QGD
     ["d2d4","d7d5","c2c4","e7e6","g1f3","g8f6","b1c3","f8e7"],
     # Nimzo-Indian shell
@@ -1506,7 +1444,7 @@ def play_game_collect_data(agent_mcts: MCTSAgent,
                     legal = [(m, 1.0) for m in env.legal_moves()]
                 probs = np.array([p for (_, p) in legal], dtype=np.float32)
                 probs = probs / (probs.sum() + 1e-12)
-                # --- CHANGED: dynamic label smoothing by branching factor ---
+                # Dynamic label smoothing by branching factor ---
                 if POLICY_SMOOTH_EPS > 0 and len(probs) > 0:
                     k = float(len(probs))
                     eps_local = float(POLICY_SMOOTH_EPS * min(1.0, (k / 40.0)))
@@ -1514,7 +1452,7 @@ def play_game_collect_data(agent_mcts: MCTSAgent,
                         u = np.full_like(probs, 1.0 / len(probs))
                         probs = (1.0 - eps_local) * probs + eps_local * u
                         probs = probs / (probs.sum() + 1e-12)
-                # --- NEW: build factored PF/PD ---
+                # Build factored PF/PD ---
                 PF = np.zeros((64,), dtype=np.float32)
                 PD = np.zeros((64, 73), dtype=np.float32)
                 for (m, p) in zip((m for m,_ in legal), probs):
@@ -1709,7 +1647,7 @@ def concat_npz_sparse(paths: List[str], out_path: str) -> bool:
     _atomic_savez(out_path, X=X, Z=Z, PF=PF, PD=PD)
     return True
 
-# --- NEW: Data augmentation helpers (8 symmetries + color flip) ---
+# --- Data augmentation helpers (8 symmetries + color flip) ---
 def _sym_map_rc(sym: int, r: int, c: int) -> Tuple[int,int]:
     # 0:I, 1:R90, 2:R180, 3:R270, 4:FH, 5:FV, 6:FD (main diag), 7:FAD (anti-diag)
     if sym == 0:   return r, c
@@ -1810,7 +1748,7 @@ def _train_on_npz(npz_path: str,
 
     net = PolicyValueNet().to(device)
 
-    # >>> NEW: initialize from previous cycle, if present
+    # Initialize from previous cycle, if present
     if os.path.exists(out_weights_path):
         try:
             sd_prev = torch.load(out_weights_path, map_location=device)
@@ -2089,8 +2027,8 @@ def _arena_run_chunk(start_g: int, end_g: int,
 def run_arena_sprt(max_games: int,
                    eval_use_net: bool,
                    explore_use_net: bool,
-                   eval_net_path: str,           # <-- CHANGED
-                   explore_net_path: str,        # <-- CHANGED
+                   eval_net_path: str,
+                   explore_net_path: str,
                    net_device: str,
                    out_dir: str,
                    cfg_eval_runtime: SearchConfig,
@@ -2098,10 +2036,9 @@ def run_arena_sprt(max_games: int,
 
     os.makedirs(out_dir, exist_ok=True)
 
-    # (Removed central _set_central_client here; we need per-side nets)
     # Build local backends (used by the sequential path below).
-    pol_eval, val_eval = build_backend(eval_use_net,    eval_net_path,    net_device, prefer_batched=False)  # <-- CHANGED
-    pol_ex,   val_ex   = build_backend(explore_use_net, explore_net_path, net_device, prefer_batched=False)  # <-- CHANGED
+    pol_eval, val_eval = build_backend(eval_use_net,    eval_net_path,    net_device, prefer_batched=False)
+    pol_ex,   val_ex   = build_backend(explore_use_net, explore_net_path, net_device, prefer_batched=False)
 
     # ---------- Path A: SPRT enabled → sequential (original behavior) ----------
     if SPRT_USE:
@@ -2258,7 +2195,7 @@ if __name__ == "__main__":
         print(f"\n========== CYCLE {cycle}/{CYCLES} ==========")
         cycle_tag = f"_c{cycle}" if CYCLES > 1 else ""
 
-        # --- NEW: safety if baseline is missing ---
+        # Safety if baseline is missing ---
         if use_net_explore and not os.path.exists(EXPLORE_WEIGHTS_PATH):
             print("[warn] explore baseline weights not found; using heuristic exploration this cycle.")
             use_net_explore = False
@@ -2282,7 +2219,7 @@ if __name__ == "__main__":
         arena_combined_path   = None
         manifest_path         = os.path.join(OUT_DIR, f"manifest{cycle_tag}.json")
 
-        # --- NEW: mini-arena (net vs heuristic) paths ---
+        # Mini-arena (net vs heuristic) paths ---
         miniarena_dir         = os.path.join(ARENA_DIR, "vs_heur")
         os.makedirs(miniarena_dir, exist_ok=True)
         miniarena_csv_path    = os.path.join(miniarena_dir, "arena_vs_heur_results.csv")
@@ -2310,7 +2247,7 @@ if __name__ == "__main__":
             json.dump(manifest, mf, indent=2)
         print(f"[info] manifest -> {manifest_path}")
 
-        # --- NEW: per-cycle ARENA runtime config (slight noise + relaxed top-k + firmer early-stop) ---
+        # Per-cycle ARENA runtime config (slight noise + relaxed top-k + firmer early-stop) ---
         _CFG_ARENA_RUNTIME = SearchConfig(**{**CFG_ARENA.__dict__})
         if cycle <= 12:
             _CFG_ARENA_RUNTIME.topk_expand = 64
@@ -2320,7 +2257,7 @@ if __name__ == "__main__":
         _CFG_ARENA_RUNTIME.early_stop_min_visits = max(CFG_ARENA.early_stop_min_visits, 48)
         _CFG_ARENA_RUNTIME.early_stop_best_ratio = 0.70
 
-        # --- NEW: per-cycle EVAL runtime config (only relax top-k early) ---
+        # Per-cycle EVAL runtime config (only relax top-k early) ---
         _CFG_EVAL_RUNTIME = SearchConfig(**{**CFG.__dict__})
         if cycle <= 12:
             _CFG_EVAL_RUNTIME.topk_expand = 64
@@ -2417,7 +2354,7 @@ if __name__ == "__main__":
 
         USE_NET_EVAL = False
         if TRAIN_AFTER_EXPLORE and SAVE_EXPLORE_DATASET and ok_concat:
-            # >>> NEW: build replay buffer (oldest->newest) if available
+            # Build replay buffer (oldest->newest) if available
             replay_paths = []
             start_c = max(1, cycle - REPLAY_K + 1)
             for c in range(start_c, cycle + 1):
@@ -2518,7 +2455,7 @@ if __name__ == "__main__":
 
             if promote:
                 print("[arena] PROMOTION: evaluation becomes the new exploration policy.")
-                # --- NEW: copy candidate -> baseline ---
+                # Copy candidate -> baseline ---
                 import shutil
                 try:
                     shutil.copy2(CANDIDATE_WEIGHTS_PATH, EXPLORE_WEIGHTS_PATH)
@@ -2530,7 +2467,7 @@ if __name__ == "__main__":
                 use_net_explore = True
             else:
                 print("[arena] No promotion this cycle. Exploration policy stays as-is.")
-            # --- NEW: Mini-arena: Net vs Heuristic (20–30 games) ---
+            # Mini-arena: Net vs Heuristic (20–30 games) ---
             print(f"[info] MINI-ARENA (net vs heuristic) start @ {datetime.datetime.now().strftime('%H:%M:%S')} | games={MINIARENA_GAMES}")
             eval_w2, ex_w2, dr2, rows2 = run_arena_sprt(
                 max_games=MINIARENA_GAMES,
@@ -2569,14 +2506,14 @@ if __name__ == "__main__":
         t_start_eval = time.time()
         eval_pairs: Dict[int, Tuple[str, Optional[str]]] = {}
         if CENTRAL_INFERENCE and USE_NET_EVAL:
-            _start_central_server(CANDIDATE_WEIGHTS_PATH, NET_DEVICE)  # <-- CHANGED
+            _start_central_server(CANDIDATE_WEIGHTS_PATH, NET_DEVICE)
             _set_central_client(_CENTRAL_REQ, _CENTRAL_RESQ)
         for g in tqdm(range(1, EVAL_GAMES + 1),
                       desc=f"EVAL (sequential {EVAL_GAMES})",
                       mininterval=0.2, dynamic_ncols=True, leave=True, file=TQDM_OUT):
             g_idx, pgn_text, pgn_path, data_path = run_one_game(
                 g, base_seed_for_cycle, _CFG_EVAL_RUNTIME, "EVAL", "mcts", MAX_PLIES, DATA_DIR, SAVE_EVAL_DATASET,
-                USE_NET_EVAL, CANDIDATE_WEIGHTS_PATH, NET_DEVICE,   # <-- CHANGED
+                USE_NET_EVAL, CANDIDATE_WEIGHTS_PATH, NET_DEVICE,
                 open_policy_plies=OPEN_POLICY_PLIES_EVAL,
                 quickdraw_halfmoves=EVAL_QUICKDRAW_HALFMOVES
             )

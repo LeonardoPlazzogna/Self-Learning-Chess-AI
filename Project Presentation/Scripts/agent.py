@@ -1,3 +1,35 @@
+"""
+MCTSAgent – interface expectations and sign conventions.
+
+ENV CONTRACT (minimal):
+- legal_moves() -> Iterable[Move]; Move is a 4-tuple (r0, c0, r1, c1) or adapter-compatible.
+- Either (push(move); pop()) or step(move) -> (obs, reward, done, info).
+- current_player ∈ {+1, -1} indicating side-to-move.
+- done: bool; info.get("result") == "checkmate" on terminal mate (optional but used here).
+- Optional: zkey / zobrist / tt_key / hash_key, fen(), board, castling_rights, en_passant_square, etc.
+  These are probed to build a transposition-key; fallbacks are slower but safe.
+
+WRAPPER CONTRACTS:
+- policy_fn:
+    * EITHER: policy_factored(env, from_mask, delta_mask) -> (from_logits[64], delta_logits[64,73])
+      where env.masks_factored() and env.legal_moves_factored() are provided.
+    * OR:     policy_fn(env) -> Dict[Move, float] (logits or probabilities; normalized later).
+- value_fn:
+    * __call__(env, root_perspective:int) -> float in [-1, 1] (root POV).
+    * Optional batching: value_many(envs, root_perspective) or value_many_features(feats, root_perspective).
+    * Optional: preferred_batch (int), features_from_env(env) -> Any.
+
+SIGN & BACKUP:
+- Values are from the root player's perspective. Backup flips sign automatically by node.player.
+- Terminal value assumes: after a mating move, env.current_player has flipped, so winner = -current_player.
+
+TREE REUSE:
+- Root is reused conservatively: if any cached child became illegal, the root is rebuilt to avoid desyncs.
+
+NOTES:
+- Early-stop is ratio-based on root visit counts; tau=policy_temperature only for early plies (<40).
+- Progressive widening bound is |children| ≤ pw_c * N^pw_alpha (if pw_c is set).
+"""
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Tuple, Optional, List, Any, Hashable
@@ -82,10 +114,10 @@ class MCTSAgent:
       - Optional progressive widening and top-k expansion
       - Optional early-stop and dynamic per-move budgets
       - Helper to export root visit distribution (for training)
-      - **Push/Pop search path** when env supports env.push()/env.pop() (fast path)
-      - **Safety guards**: legality checks + pruning to avoid desync errors
-      - **Transposition Table (TT)**: caches priors/values by state key to reduce recompute
-      - **Optional batched GPU evals**: if `value_fn` exposes batch hooks, we micro-batch leaf evals
+      - Push/Pop search path when env supports env.push()/env.pop() (fast path)
+      - Safety guards: legality checks + pruning to avoid desync errors
+      - Transposition Table (TT): caches priors/values by state key to reduce recompute
+      - Optional batched GPU evals: if `value_fn` exposes batch hooks, we micro-batch leaf evals
     """
 
     def __init__(self, policy_fn, value_fn, cfg: SearchConfig, eval_batch_size: Optional[int] = None):
@@ -119,6 +151,9 @@ class MCTSAgent:
     def eval_mode(self):
         self._explore = False
 
+    # Fast path: try all root legal moves on a cloned env and immediately return a mate-in-1.
+    # This avoids wasting the search budget when a tactical win is trivial.
+    # Assumes info["result"] == "checkmate" is set by env.step; otherwise this path quietly no-ops.
     def choose_move(self, env, explore: Optional[bool] = None) -> Move:
         # --- Instant mate-in-1 check at root ---
         try:
@@ -379,6 +414,11 @@ class MCTSAgent:
                 return
 
     # -------- batched push/pop sims (micro-batching of leaf evals) --------
+    # Micro-batching strategy:
+    # - Perform selection/expansion to collect up to B leaves (without evaluation).
+    # - Use value_many(_features) if exposed; otherwise fall back to scalar calls.
+    # - Any TT hits are backed up immediately and are *not* sent to the NN.
+    # This keeps the search policy identical while reducing NN overhead on GPU.
     def _run_sims_batched_pushpop(self, root_env, root_node: _Node, root_perspective: int, budget: int):
         """
         Collect up to `eval_batch_size` leaves per wave, evaluate them in batch using
@@ -471,6 +511,12 @@ class MCTSAgent:
                         if (max(visits) / max(1, total)) >= self.cfg.early_stop_best_ratio:
                             break
 
+    # Returns either None (if terminal backup already applied) or a tuple:
+    #   (path, leaf_key, features_or_None, env_snapshot_or_None, value_or_None)
+    # Invariants:
+    # - Exactly one of features_or_None / env_snapshot_or_None is provided for NN eval.
+    # - If TT already holds a value for leaf_key, we short-circuit and backup immediately.
+    # - push/pop is used and *always* unwound before returning, keeping root_env pristine.
     def _select_to_leaf_request(self, root_env, root_node: _Node, root_perspective: int):
         """
         One simulation: descend/expand to a leaf and return a request tuple for evaluation:
@@ -588,6 +634,9 @@ class MCTSAgent:
                     break
 
     # -------- re-rooting / warm start --------
+    # Root reuse is allowed only if *all* previously cached children remain legal in the new position.
+    # This is conservative but avoids subtle desynchronizations (e.g., stateful legality like EP/castling).
+    # If your env guarantees stability across pushes, a finer-grained salvage of surviving children is possible.
     def _prepare_root(self, env, root_player: int, explore: bool):
         legal = getattr(env, "legal_moves", None)
         legal_moves = set(legal()) if callable(legal) else set()
@@ -652,6 +701,10 @@ class MCTSAgent:
         node.expanded = True
 
     # -------- helpers --------
+    # UCB with prior (PUCT). We add:
+    # - Random shuffle to break ties stochastically (helps exploration symmetry).
+    # - Optional repetition penalty at the *root only* during training
+    #   to steer away from immediate twofold repetitions when desired.
     def _best_child(self, node: _Node, env) -> Tuple[Move, _Node]:
         sqrt_N = math.sqrt(max(1, node.N))
         c = self.cfg.c_puct
@@ -663,7 +716,7 @@ class MCTSAgent:
         for mv, ch in items:
             u = c * ch.prior * (sqrt_N / (1 + ch.N))
             score = ch.Q + u
-            # NEW: repetition penalty at root
+            # repetition penalty at root
             score += self._root_repeat_penalty(env, mv, node)
             if score > best_score:
                 best_score = score
@@ -688,13 +741,16 @@ class MCTSAgent:
             node.W += v_leaf_from_root if (node.player == root_perspective) else -v_leaf_from_root
             node.Q = node.W / node.N
 
+    # Used only when strictly necessary (fallback and batched snapshots without feature hook)
     def _clone_env(self, env):
-        # Used only when strictly necessary (fallback and batched snapshots without feature hook)
         try:
             return env.clone()
         except AttributeError:
             return copy.deepcopy(env)
 
+    # Terminal evaluation assumes env.current_player indicates side-to-move in the terminal node.
+    # For a just-delivered mate, winner = -current_player. If your env keeps current_player
+    # pointing to the winner at terminal, invert this logic accordingly.
     def _terminal_value(self, env, root_perspective: int) -> float:
         info = getattr(env, "info", {}) if hasattr(env, "info") else {}
         res = info.get("result")
@@ -718,6 +774,10 @@ class MCTSAgent:
             return {m: p for m in moves}
         return {m: max(1e-12, x) / s for m, x in filtered.items()}
     
+    # Masked softmax for possibly huge negative logits:
+    # - Masked-out entries get -1e30 so they contribute ~0 after exponentiation.
+    # - Subtract max for numerical stability.
+    # - Returns 0 on masked positions and normalized mass over unmasked entries.
     def _softmax_masked(self, x: np.ndarray, mask: np.ndarray, axis: Optional[int]=None) -> np.ndarray:
         """
         Softmax over logits x with a 0/1 mask; returns probabilities only over masked entries,
@@ -731,7 +791,6 @@ class MCTSAgent:
         e *= m
         s = np.sum(e, axis=axis, keepdims=True)
         return e / np.maximum(s, 1e-12)
-
 
     def _apply_dirichlet_noise(self, priors: Dict[Move, float], alpha: float, eps: float) -> Dict[Move, float]:
         moves = list(priors.keys())
@@ -775,6 +834,10 @@ class MCTSAgent:
         idx = int(np.random.choice(len(moves), p=p))
         return moves[idx]
     
+    # Applies only at the root and only in training mode.
+    # Requires env._position_key() and env.position_counts to reflect the *resulting* position
+    # after applying `move`. If the environment does not maintain these, the penalty is 0.
+    # Magnitude is subtracted directly from the PUCT score (unitless heuristic).
     def _root_repeat_penalty(self, env, move, node: _Node) -> float:
         """Negative penalty if taking `move` at the root would enter a position
         already seen twice (i.e., immediate twofold repetition)."""
@@ -804,6 +867,10 @@ class MCTSAgent:
         return pen
 
     # -------- internal --------
+    # Heuristic per-move budget:
+    # - Scale up when the move count is "sharp" (<= threshold), down when "wide" (>= threshold).
+    # - Further scale down in the opening plies (< 8).
+    # - Always enforce a floor at dynamic_min_sims. This does not affect correctness, only speed/quality.
     def _compute_sim_budget(self, env) -> int:
         if not self.cfg.dynamic_budget_enabled:
             return int(self.cfg.n_simulations)
@@ -833,6 +900,13 @@ class MCTSAgent:
             return False
 
     # -------- TT-aware helpers --------
+    # Transposition key preference order:
+    # 1) Fast integer Zobrist if available (("z", int)).
+    # 2) Other single-attr keys ("a", ...).
+    # 3) FEN string ("fen", ...).
+    # 4) Structured tuple snapshot ("tu", ...).
+    # Later fallbacks are slower/heavier but deterministic. Collisions are unlikely but not impossible;
+    # if your env exposes a canonical hash, prefer that over the tuple fallback.
     def _state_key(self, env) -> Optional[Hashable]:
         # Prefer Zobrist integer if present
         try:
@@ -906,7 +980,7 @@ class MCTSAgent:
                 slot["priors"] = dict(pri)
             return pri
 
-        # Path B: legacy flat policy (unchanged)
+        # Path B: legacy flat policy
         base = self.policy_fn(env)  # Dict[Move,float] or logits your adapter already produced
         pri = self._normalize_priors(base, env)
         if key is not None:
@@ -926,8 +1000,8 @@ class MCTSAgent:
             slot["value"] = float(v)
         return v
 
+    # Optional hook for batched GPU eval: wrapper may expose feature extraction
     def _maybe_features_from_env(self, env):
-        # Optional hook for batched GPU eval: wrapper may expose feature extraction
         try:
             if hasattr(self.value_fn, "features_from_env"):
                 return self.value_fn.features_from_env(env)

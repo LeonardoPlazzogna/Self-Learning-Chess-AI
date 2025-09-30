@@ -38,8 +38,8 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 # Import environment and MCTS agent
-from env3 import ChessEnv
-from agent5 import MCTSAgent, SearchConfig
+from environment import ChessEnv
+from agent import MCTSAgent, SearchConfig
 
 # ---------- Windows / notebook safety ----------
 import multiprocessing as mp
@@ -989,7 +989,7 @@ def _hash_state(state: np.ndarray) -> bytes:
 def _inference_server_proc(req_q, res_q, weights_path: str, device: str, use_half: bool,
                            flush_ms: int, max_batch: int):
     import torch
-    from model2 import PolicyValueNetFactored as PolicyValueNet
+    from model import PolicyValueNetFactored as PolicyValueNet
     try:
         torch.set_num_threads(1)
         torch.set_num_interop_threads(1)
@@ -1202,7 +1202,7 @@ def build_backend(use_net: bool,
         return pol, val
 
     import torch
-    from model2 import PolicyValueNetFactored as PolicyValueNet
+    from model import PolicyValueNetFactored as PolicyValueNet
     _local = {"net": None, "dtype": None, "device": None}
     def _ensure():
         if _local["net"] is None:

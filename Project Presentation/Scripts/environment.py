@@ -87,7 +87,7 @@ def _rot180_rc(r: int, c: int) -> Tuple[int,int]:
     return (7 - r, 7 - c)
 
 # -----------------------------------------------------------------------------
-# Added: Exception hierarchy and safety constants (non-intrusive)
+# Exception hierarchy and safety constants (non-intrusive)
 # -----------------------------------------------------------------------------
 class ChessEnvError(Exception):
     """Base class for ChessEnv-specific errors."""
@@ -147,7 +147,7 @@ class ChessEnv:
     def _init_zobrist_tables(cls) -> None:
         if cls._ZOBRIST_INIT_DONE:
             return
-        # Fixed base seed for reproducibility
+        # Base seed for reproducibility
         seed = 0x9E3779B97F4A7C15
         def nxt():
             nonlocal seed

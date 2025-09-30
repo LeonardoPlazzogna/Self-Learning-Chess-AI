@@ -6,7 +6,7 @@ from torch.optim.swa_utils import AveragedModel
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 
-from model2 import PolicyValueNet  # must output (from_logits, delta_logits, value)
+from model import PolicyValueNet  # must output (from_logits, delta_logits, value)
 
 # ----------------------------
 # Dataset
