@@ -45,15 +45,13 @@ import numpy as np
 Move = Tuple[int, int, int, int]
 Board = List[List[int]]
 
-# ---------------------- FACTORED POLICY DELTA VOCAB (D=73) ----------------------
+# ---------------------- FACTORED POLICY DELTA VOCAB (D=64) ----------------------
 # White-centric canonical deltas. Black moves are mapped by 180° rotation
 # so that "forward" is +row and left/right match white's perspective.
-# Layout: first 56 = queen-like slides (8 dirs × steps 1..7),
-#         then 8 knight jumps,
-#         then 9 underpromotion placeholders: (R,B,N) × (F, L, R).
+# Layout: 56 queen-like slides (8 dirs × steps 1..7) + 8 knight jumps.
 _DIRS_8 = [(1,0), (-1,0), (0,1), (0,-1), (1,1), (1,-1), (-1,1), (-1,-1)]
 
-def _build_delta_table_73() -> List[Tuple[int,int,str,Tuple]]:
+def _build_delta_table() -> List[Tuple[int,int,str,Tuple]]:
     table: List[Tuple[int,int,str,Tuple]] = []
     # 56 sliding (Queen-like)
     for (dr, dc) in _DIRS_8:
@@ -62,19 +60,13 @@ def _build_delta_table_73() -> List[Tuple[int,int,str,Tuple]]:
     # 8 knight
     for (dr, dc) in [(2,1),(2,-1),(-2,1),(-2,-1),(1,2),(1,-2),(-1,2),(-1,-2)]:
         table.append((dr, dc, "KNIGHT", ()))
-    # 9 underpromotion placeholders: (piece in {R,B,N}) × (F,L,R)
-    # Geometry uses dr=+1 and dc ∈ {0,-1,+1} to match the last-rank step.
-    for promo in ("R","B","N"):
-        for cap in ("F","L","R"):  # forward, capture-left, capture-right
-            dc = 0 if cap=="F" else (-1 if cap=="L" else +1)
-            table.append((1, dc, f"UNDER_{promo}_{cap}", (promo, cap)))
     return table
 
-DELTA_TABLE_73: List[Tuple[int,int,str,Tuple]] = _build_delta_table_73()
-D73: int = len(DELTA_TABLE_73)  # 73
-# Fast lookup for slide/knight by (dr,dc). Underpromotions will not be looked up here.
-DELTA_TO_INDEX_73: Dict[Tuple[int,int], int] = {
-    (dr, dc): idx for idx, (dr, dc, kind, meta) in enumerate(DELTA_TABLE_73)
+DELTA_TABLE: List[Tuple[int,int,str,Tuple]] = _build_delta_table()
+D: int = len(DELTA_TABLE)  # 64
+# Fast lookup for slide/knight by (dr,dc).
+DELTA_TO_INDEX: Dict[Tuple[int,int], int] = {
+    (dr, dc): idx for idx, (dr, dc, kind, meta) in enumerate(DELTA_TABLE)
     if kind in ("SLIDE","KNIGHT")
 }
 
@@ -209,6 +201,12 @@ class ChessEnv:
         self.castling_rights = {"K": True, "Q": True, "k": True, "q": True}
         self.halfmove_clock = 0
         self.position_counts: Dict[Hashable, int] = {}
+        # --- PGN / counters ---
+        self.ply_count = 0  # number of half-moves actually played via step()
+        self._record_pgn = False
+        self._pgn_headers: Dict[str, str] = {}
+        self._pgn_san: List[str] = []
+        self._pgn_result: Optional[str] = None
 
         # Build initial Zobrist key from scratch
         self.zkey: int = self._compute_zobrist_key()
@@ -705,7 +703,7 @@ class ChessEnv:
     # ===================== FACTORED POLICY: PUBLIC API =========================
     def legal_moves_factored(self) -> List[Tuple[int, int]]:
         """
-        Return legal moves as (from_idx, delta_idx_0_72) in a white-centric delta space.
+        Return legal moves as (from_idx, delta_idx_0_63) in a white-centric delta space.
         Black's moves are mapped by 180° rotation so the vocabulary is shared.
         """
         return [self.move_to_factored(mv) for mv in self.legal_moves_fast()]
@@ -714,22 +712,21 @@ class ChessEnv:
         """
         Build masks for the current side to move:
         - from_mask: [64]  (1 if any legal delta from that 'from' square)
-        - delta_mask: [64, 73]  (1 for each legal delta index from that 'from')
+        - delta_mask: [64, 64]  (1 for each legal delta index from that 'from')
         """
         from_mask = np.zeros(64, dtype=np.bool_)
-        delta_mask = np.zeros((64, D73), dtype=np.bool_)
+        delta_mask = np.zeros((64, D), dtype=np.bool_)
         for mv in self.legal_moves_fast():
             i, d = self.move_to_factored(mv)
             from_mask[i] = True
-            if 0 <= d < D73:
+            if 0 <= d < D:
                 delta_mask[i, d] = True
         return from_mask, delta_mask
 
     def move_to_factored(self, mv: Move) -> Tuple[int, int]:
         """
-        Map a concrete legal move (fr,fc,tr,tc) to (from_idx, delta_idx) in the 73-delta space.
-        - Auto-queen promotions map to their geometric SLIDE plane (dr,dc) with step=1,
-          which matches AlphaZero-style heads (queen promotion not separated).
+        Map a concrete legal move (fr,fc,tr,tc) to (from_idx, delta_idx) in the 64-delta space.
+        - Auto-queen promotions map to their geometric SLIDE plane (dr,dc) with step=1 (promotion choice not separated).
         - Castling maps to SLIDE (0,±2).
         """
         fr, fc, tr, tc = mv
@@ -746,12 +743,10 @@ class ChessEnv:
 
         # Try SLIDE/KNIGHT lookup first (covers king steps, castles, queen promo geometry)
         key = (dr, dc)
-        idx = DELTA_TO_INDEX_73.get(key)
+        idx = DELTA_TO_INDEX.get(key)
         if idx is not None:
             return from_idx, idx
 
-        # If we ever support underpromotions in the env, we would detect here and map to
-        # the proper UNDER_* indices. For now, env auto-queens -> no underpromotion mapping.
         raise InvalidStateError(
             f"move_to_factored: could not map move {mv} with white-perspective delta ({dr},{dc})."
         )
@@ -765,10 +760,10 @@ class ChessEnv:
             raise OutOfBoundsError(f"from_idx out of range: {from_idx}")
 
         fr_w, fc_w = divmod(from_idx, 8)
-        if not (0 <= delta_idx < D73):
+        if not (0 <= delta_idx < D):
             raise OutOfBoundsError(f"delta_idx out of range: {delta_idx}")
 
-        dr, dc, kind, meta = DELTA_TABLE_73[delta_idx]
+        dr, dc, kind, meta = DELTA_TABLE[delta_idx]
 
         tr_w, tc_w = fr_w + dr, fc_w + dc
         if not self.in_bounds(tr_w, tc_w):
@@ -1127,6 +1122,10 @@ class ChessEnv:
         legal = set(self.legal_moves())
         if action not in legal:
             raise IllegalMoveError(f"Illegal move: {action}")
+        
+        # Compute SAN for PGN recording (from the *current* position)
+        san_for_pgn = self.move_to_san(action) if self._record_pgn else None
+        mover_side = self.current_player  # +1 white, -1 black (side making this move)
 
         fr, fc, tr, tc = action
         piece = self.board[fr][fc]
@@ -1245,28 +1244,58 @@ class ChessEnv:
             if not self.legal_moves():
                 self.done = True
                 self.info = {"result": "checkmate"}
+                # PGN bookkeeping
+                self.ply_count += 1
+                if self._record_pgn and san_for_pgn is not None:
+                    self._pgn_san.append(san_for_pgn)
+                    self._pgn_result = "1-0" if mover_side == 1 else "0-1"
                 return self.board, 1, True, self.info
         else:
             if not self.legal_moves():
                 self.done = True
                 self.info = {"result": "stalemate"}
+                # PGN bookkeeping
+                self.ply_count += 1
+                if self._record_pgn and san_for_pgn is not None:
+                    self._pgn_san.append(san_for_pgn)
+                    self._pgn_result = "1/2-1/2"
                 return self.board, 0, True, self.info
 
         if self._insufficient_material():
             self.done = True
             self.info = {"result": "insufficient"}
+            # PGN bookkeeping
+            self.ply_count += 1
+            if self._record_pgn and san_for_pgn is not None:
+                self._pgn_san.append(san_for_pgn)
+                self._pgn_result = "1/2-1/2"
             return self.board, 0, True, self.info
 
         if self.halfmove_clock >= 100:
             self.done = True
             self.info = {"result": "fifty-move"}
+            # PGN bookkeeping
+            self.ply_count += 1
+            if self._record_pgn and san_for_pgn is not None:
+                self._pgn_san.append(san_for_pgn)
+                self._pgn_result = "1/2-1/2"
             return self.board, 0, True, self.info
 
         if rep_count >= 3:
             self.done = True
             self.info = {"result": "threefold"}
+            # PGN bookkeeping
+            self.ply_count += 1
+            if self._record_pgn and san_for_pgn is not None:
+                self._pgn_san.append(san_for_pgn)
+                self._pgn_result = "1/2-1/2"
             return self.board, 0, True, self.info
 
+        # PGN bookkeeping (nonterminal)
+        self.ply_count += 1
+        if self._record_pgn and san_for_pgn is not None:
+            self._pgn_san.append(san_for_pgn)
+        
         return self.board, 0, False, {}
 
     # -------------------------------------------------------------------------
@@ -1278,3 +1307,371 @@ class ChessEnv:
         for row in self.board:
             print(" ".join(f"{x:2}" for x in row))
         print()
+
+    # -------------------------------------------------------------------------
+    # Algebraic helpers (file/rank <-> indices, piece letters)
+    # -------------------------------------------------------------------------
+    _FILES = "abcdefgh"
+    _RANKS = "12345678"
+    _PIECE_TO_SAN = {1:"", 2:"N", 3:"B", 4:"R", 5:"Q", 6:"K"}
+    _SAN_TO_PIECE = {"":1, "N":2, "B":3, "R":4, "Q":5, "K":6}
+
+    @classmethod
+    def _sq_to_alg(cls, r: int, c: int) -> str:
+        return f"{cls._FILES[c]}{cls._RANKS[r]}"
+
+    @classmethod
+    def _alg_to_sq(cls, s: str) -> Tuple[int,int]:
+        if len(s) != 2 or s[0] not in cls._FILES or s[1] not in cls._RANKS:
+            raise InvalidMoveFormatError(f"Bad square: {s}")
+        c = cls._FILES.index(s[0])
+        r = cls._RANKS.index(s[1])
+        return (r, c)
+
+    def _is_en_passant_capture(self, mv: Move) -> bool:
+        fr, fc, tr, tc = mv
+        piece = self.board[fr][fc]
+        return (abs(piece) == 1 and (tr, tc) == self.en_passant_square and fc != tc and self.board[tr][tc] == 0)
+
+    def _would_give_check_or_mate(self, mv: Move) -> Tuple[bool,bool]:
+        """Push mv, test if it gives check or mate against the opponent, pop."""
+        self.push(mv)
+        opp = self.current_player  # after push(), it's opponent to move
+        in_check = self.in_check(opp)
+        legal = self.legal_moves_fast()
+        checkmate = (in_check and len(legal) == 0)
+        self.pop()
+        return in_check, checkmate
+
+    # -------------------------------------------------------------------------
+    # SAN generation / parsing
+    # -------------------------------------------------------------------------
+    def move_to_san(self, mv: Move) -> str:
+        """Return SAN for a *legal* move mv in the current position."""
+        fr, fc, tr, tc = mv
+        piece = self.board[fr][fc]
+        ap = abs(piece)
+
+        # Castling
+        if ap == 6 and fr == tr and abs(tc - fc) == 2:
+            san = "O-O" if tc > fc else "O-O-O"
+            chk, mate = self._would_give_check_or_mate(mv)
+            if mate: san += "#"
+            elif chk: san += "+"
+            return san
+
+        dst = self._sq_to_alg(tr, tc)
+        is_capture = (self.board[tr][tc] * piece < 0) or self._is_en_passant_capture(mv)
+        chk, mate = self._would_give_check_or_mate(mv)
+
+        if ap == 1:
+            # Pawn move
+            san = ""
+            if is_capture:
+                san += self._FILES[fc] + "x" + dst
+            else:
+                san += dst
+            # Auto-queen promotion
+            if (piece > 0 and tr == 7) or (piece < 0 and tr == 0):
+                san += "=Q"
+        else:
+            # Piece move with disambiguation
+            letter = self._PIECE_TO_SAN[ap]
+            # Find same-type pieces that can also move to (tr,tc)
+            ambiguities = []
+            for r in range(8):
+                for c in range(8):
+                    if (r, c) == (fr, fc):
+                        continue
+                    if self.board[r][c] == piece:
+                        cand = (r, c, tr, tc)
+                        for lm in self.legal_moves_fast():
+                            if lm == cand:
+                                ambiguities.append((r, c))
+                                break
+            dis = ""
+            if ambiguities:
+                same_file = any(c == fc for _, c in ambiguities)
+                same_rank = any(r == fr for r, _ in ambiguities)
+                if same_file and same_rank:
+                    dis = f"{self._FILES[fc]}{self._RANKS[fr]}"
+                elif same_file:
+                    dis = f"{self._RANKS[fr]}"
+                elif same_rank:
+                    dis = f"{self._FILES[fc]}"
+                else:
+                    dis = f"{self._FILES[fc]}"
+
+            san = letter + dis + ("x" if is_capture else "") + dst
+
+        if mate:
+            san += "#"
+        elif chk:
+            san += "+"
+
+        return san
+
+    def san_to_move(self, san: str) -> Move:
+        """Parse a SAN string in the *current* position into a unique legal move."""
+        san = san.strip().replace("e.p.", "").replace("ep", "")
+        # Castling
+        if san in ("O-O", "O-O+", "O-O#", "0-0", "0-0+", "0-0#"):
+            for mv in self.legal_moves_fast():
+                fr, fc, tr, tc = mv
+                if abs(self.board[fr][fc]) == 6 and fr == tr and (tc - fc) == 2:
+                    return mv
+            raise IllegalMoveError("No legal O-O available")
+        if san in ("O-O-O", "O-O-O+", "O-O-O#", "0-0-0", "0-0-0+", "0-0-0#"):
+            for mv in self.legal_moves_fast():
+                fr, fc, tr, tc = mv
+                if abs(self.board[fr][fc]) == 6 and fr == tr and (fc - tc) == 2:
+                    return mv
+            raise IllegalMoveError("No legal O-O-O available")
+
+        # Strip check/mate suffix
+        if san.endswith("+") or san.endswith("#"):
+            san = san[:-1]
+
+        # Promotion (only =Q supported since engine auto-queens)
+        promo = False
+        if "=Q" in san:
+            san = san.replace("=Q", "")
+            promo = True
+
+        # Identify piece letter
+        piece_letter = ""
+        if san and san[0] in "NBRQK":
+            piece_letter = san[0]
+            san_body = san[1:]
+        else:
+            san_body = san  # pawn
+
+        # Split capture marker
+        if "x" in san_body:
+            left, dst_alg = san_body.split("x", 1)
+            capture = True
+        else:
+            capture = False
+            left, dst_alg = san_body[:-2], san_body[-2:]
+
+        tr, tc = self._alg_to_sq(dst_alg)
+
+        # Disambiguation
+        dis_file = None
+        dis_rank = None
+        if left:
+            if len(left) == 2:
+                dis_file = left[0] if left[0] in self._FILES else None
+                dis_rank = left[1] if left[1] in self._RANKS else None
+            elif len(left) == 1:
+                if left in self._FILES:
+                    dis_file = left
+                elif left in self._RANKS:
+                    dis_rank = left
+
+        # Find matching legal moves
+        candidates = []
+        ap = self._SAN_TO_PIECE[piece_letter]
+        for mv in self.legal_moves_fast():
+            fr, fc, r, c = mv
+            if (r, c) != (tr, tc):
+                continue
+            if abs(self.board[fr][fc]) != ap:
+                continue
+            if dis_file is not None and self._FILES[fc] != dis_file:
+                continue
+            if dis_rank is not None and self._RANKS[fr] != dis_rank:
+                continue
+            is_cap = (self.board[r][c] * self.board[fr][fc] < 0) or self._is_en_passant_capture(mv)
+            if capture and not is_cap:
+                continue
+            if not capture and is_cap:
+                continue
+            if ap == 1 and ((self.board[fr][fc] > 0 and r == 7) or (self.board[fr][fc] < 0 and r == 0)):
+                if not promo:
+                    continue
+            candidates.append(mv)
+
+        if len(candidates) != 1:
+            raise IllegalMoveError(f"Ambiguous or illegal SAN '{san}': {candidates}")
+        return candidates[0]
+
+    # -------------------------------------------------------------------------
+    # Perft (counts leaf nodes at given depth using push/pop)
+    # -------------------------------------------------------------------------
+    def perft(self, depth: int, use_fast: bool = True) -> int:
+        if depth < 0:
+            raise ValueError("depth must be >= 0")
+        if depth == 0:
+            return 1
+        gen = self.legal_moves_fast if use_fast else self.legal_moves
+        total = 0
+        for mv in gen():
+            self.push(mv)
+            total += self.perft(depth - 1, use_fast=use_fast)
+            self.pop()
+        return total
+
+    def perft_divide(self, depth: int, use_fast: bool = True) -> Dict[Move, int]:
+        if depth <= 0:
+            raise ValueError("depth must be >= 1 for divide")
+        gen = self.legal_moves_fast if use_fast else self.legal_moves
+        out: Dict[Move, int] = {}
+        for mv in gen():
+            self.push(mv)
+            out[mv] = self.perft(depth - 1, use_fast=use_fast)
+            self.pop()
+        return out
+
+    # -------------------------------------------------------------------------
+    # FEN / EPD
+    # -------------------------------------------------------------------------
+    def fen(self) -> str:
+        """Export current position as FEN. Fullmove number derived from ply_count."""
+        rows = []
+        for r in range(7, -1, -1):  # FEN ranks 8->1
+            run = 0
+            parts = []
+            for c in range(8):
+                v = self.board[r][c]
+                if v == 0:
+                    run += 1
+                else:
+                    if run: parts.append(str(run)); run = 0
+                    ch = {1:"P",2:"N",3:"B",4:"R",5:"Q",6:"K"}[abs(v)]
+                    if v < 0: ch = ch.lower()
+                    parts.append(ch)
+            if run: parts.append(str(run))
+            rows.append("".join(parts))
+        placement = "/".join(rows)
+
+        stm = "w" if self.current_player == 1 else "b"
+        cr = "".join(k for k in "KQkq" if self.castling_rights[k]) or "-"
+        ep = "-" if self.en_passant_square is None else self._sq_to_alg(*self.en_passant_square)
+        half = self.halfmove_clock
+        full = 1 + (self.ply_count // 2)
+        return f"{placement} {stm} {cr} {ep} {half} {full}"
+
+    def set_fen(self, fen: str) -> None:
+        """Load FEN into the environment; resets repetition counters and zkey."""
+        parts = fen.strip().split()
+        if len(parts) not in (4, 6):
+            raise InvalidStateError("FEN must have 4 or 6 fields")
+        placement, stm, cr, ep = parts[0], parts[1], parts[2], parts[3]
+        half = int(parts[4]) if len(parts) >= 5 else 0
+        full = int(parts[5]) if len(parts) >= 6 else 1
+
+        rows = placement.split("/")
+        if len(rows) != 8:
+            raise InvalidStateError("FEN placement must have 8 ranks")
+        board: Board = [[0]*8 for _ in range(8)]
+        for fen_r, row in enumerate(rows):
+            r = 7 - fen_r  # FEN rank 8->1
+            c = 0
+            for ch in row:
+                if ch.isdigit():
+                    c += int(ch)
+                else:
+                    if c >= 8:
+                        raise InvalidStateError("Too many files in FEN rank")
+                    piece_map = {"p":-1,"n":-2,"b":-3,"r":-4,"q":-5,"k":-6,
+                                 "P": 1,"N": 2,"B": 3,"R": 4,"Q": 5,"K": 6}
+                    if ch not in piece_map:
+                        raise InvalidStateError(f"Bad FEN piece: {ch}")
+                    board[r][c] = piece_map[ch]
+                    c += 1
+            if c != 8:
+                raise InvalidStateError("FEN rank does not fill 8 files")
+
+        self.board = board
+        self.current_player = 1 if stm == "w" else -1
+        self.castling_rights = {k: (k in cr) for k in ("K","Q","k","q")}
+        self.en_passant_square = None if ep == "-" else self._alg_to_sq(ep)
+        self.halfmove_clock = half
+        self.ply_count = (full - 1) * 2 + (0 if self.current_player == 1 else 1)
+
+        self.done = False
+        self.info = {}
+        self.position_counts = {}
+        self.zkey = self._compute_zobrist_key()
+        self._increment_position_repetition()
+        self._validate_full_state(strict=False)
+
+    def to_epd(self, ops: Optional[Dict[str, str]] = None) -> str:
+        """EPD = first 4 FEN fields + optional operations 'key value;'."""
+        f = self.fen().split()
+        base = " ".join(f[:4])
+        if not ops:
+            return base
+        tail = " ".join(f'{k} {v};' for k, v in ops.items())
+        return f"{base} {tail}"
+
+    def set_epd(self, epd: str) -> None:
+        """Load an EPD string (ignores halfmove/fullmove)."""
+        parts = epd.strip().split()
+        if len(parts) < 4:
+            raise InvalidStateError("EPD must have at least 4 tokens")
+        placement, stm, cr, ep = parts[:4]
+        self.set_fen(f"{placement} {stm} {cr} {ep} 0 1")
+
+    # -------------------------------------------------------------------------
+    # PGN utilities (simple, SAN-based)
+    # -------------------------------------------------------------------------
+    def _is_standard_initial(self) -> bool:
+        std = self._initial_board()
+        if self.board != std: return False
+        if self.current_player != 1: return False
+        if self.en_passant_square is not None: return False
+        if self.halfmove_clock != 0: return False
+        if self.castling_rights != {"K":True,"Q":True,"k":True,"q":True}: return False
+        return True
+
+    def start_pgn(self, headers: Optional[Dict[str, str]] = None) -> None:
+        """Begin recording SAN moves and headers for PGN export."""
+        self._record_pgn = True
+        self._pgn_headers = dict(headers) if headers else {}
+        self._pgn_san = []
+        self._pgn_result = None
+
+    def export_pgn(self, headers: Optional[Dict[str, str]] = None, include_fen_if_nonstandard: bool = True) -> str:
+        """Return a PGN string for the moves played since start_pgn()."""
+        tags = dict(self._pgn_headers)
+        if headers:
+            tags.update(headers)
+        tags.setdefault("Event", "?")
+        tags.setdefault("Site", "?")
+        tags.setdefault("Date", "????.??.??")
+        tags.setdefault("Round", "?")
+        tags.setdefault("White", "?")
+        tags.setdefault("Black", "?")
+
+        if include_fen_if_nonstandard and not self._is_standard_initial():
+            tags["SetUp"] = "1"
+            tags["FEN"] = self.fen()
+
+        result = self._pgn_result or "*"
+        tags.setdefault("Result", result)
+
+        lines = [f'[{k} "{v}"]' for k, v in tags.items()]
+
+        san = list(self._pgn_san)
+        parts = []
+        move_no = 1
+        i = 0
+        while i < len(san):
+            if i % 2 == 0:
+                parts.append(f"{move_no}. {san[i]}")
+                i += 1
+                if i < len(san):
+                    parts.append(f"{san[i]}")
+                    i += 1
+                move_no += 1
+            else:
+                parts.append(f"{move_no}... {san[i]}")
+                i += 1
+                move_no += 1
+        parts.append(result)
+        lines.append("")
+        lines.append(" ".join(parts))
+
+        return "\n".join(lines)

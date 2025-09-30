@@ -6,7 +6,7 @@ from torch.optim.swa_utils import AveragedModel
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 
-from model import PolicyValueNet  # must output (from_logits, delta_logits, value)
+from model import PolicyValueNet
 
 # ----------------------------
 # Dataset
@@ -18,7 +18,7 @@ class ChessDataset(Dataset):
     Expects NPZ files (one or more) with:
       - X  : float32 [N, 18, 8, 8]     input planes
       - PF : float32 [N, 64]           from-square marginal (sum=1 over 64)
-      - PD : float32 [N, 64, 73]       per-from conditional over deltas
+      - PD : float32 [N, 64, 64]       per-from conditional over deltas
                                        (for each i with legal moves, PD[i,:] sums to 1)
       - Z  : float32 [N] or [N,1]      scalar value in [-1, 1] (side-to-move outcome)
 
@@ -32,7 +32,7 @@ class ChessDataset(Dataset):
             if "PF" not in d or "PD" not in d:
                 raise ValueError(
                     f"{p} is legacy/flat and lacks PF/PD. "
-                    f"Regenerate dataset with factored targets (PF:[64], PD:[64,73])."
+                    f"Regenerate dataset with factored targets (PF:[64], PD:[64,64])."
                 )
             xs.append(d["X"].astype(np.float32))
             pfs.append(d["PF"].astype(np.float32))
@@ -57,13 +57,13 @@ class ChessDataset(Dataset):
         Returns:
             X  : torch.float32 [18,8,8]
             PF : torch.float32 [64]
-            PD : torch.float32 [64,73]
+            PD : torch.float32 [64,64]
             Z  : torch.float32 [] (scalar)
         """
         return (
             torch.from_numpy(self.X[idx]),                    # [18,8,8]
             torch.from_numpy(self.PF[idx]),                   # [64]
-            torch.from_numpy(self.PD[idx]),                   # [64,73]
+            torch.from_numpy(self.PD[idx]),                   # [64,64]
             torch.tensor(self.Z[idx], dtype=torch.float32),   # []
         )
 
@@ -108,9 +108,9 @@ def train_one_epoch(net: nn.Module,
 
     Policy factorization (per sample):
         Let p_from = softmax(from_logits) in R^{64}
-            p_delta[i] = softmax(delta_logits[i, :]) in R^{73}
+            p_delta[i] = softmax(delta_logits[i, :]) in R^{64}
 
-        Targets: PF in Δ^{64}, PD[i] in Δ^{73} for legal i.
+        Targets: PF in Δ^{64}, PD[i] in Δ^{64} for legal i.
         Loss_from  = CE(PF || p_from) = - Σ_i PF[i] log p_from[i]
         Loss_delta = Σ_i PF[i] * CE(PD[i] || p_delta[i])
         Loss_policy = mean(Loss_from + Loss_delta) over batch
@@ -134,21 +134,21 @@ def train_one_epoch(net: nn.Module,
         # Move to device (pin_memory in DataLoader accelerates H2D on CUDA)
         X  = X.to(device, non_blocking=True)        # [B,18,8,8]
         PF = PF.to(device, non_blocking=True)       # [B,64]
-        PD = PD.to(device, non_blocking=True)       # [B,64,73]
+        PD = PD.to(device, non_blocking=True)       # [B,64,64]
         Z  = Z.to(device, non_blocking=True)        # [B]
 
-        # Forward: model must return ([B,64], [B,64,73], [B,1])
+        # Forward: model must return ([B,64], [B,64,64], [B,1])
         from_logits, delta_logits, v = net(X)
         v = v.squeeze(1)                            # [B]
 
         # Log-softmax for stable CE with soft targets
         log_p_from  = torch.log_softmax(from_logits, dim=1)  # [B,64]
-        log_p_delta = torch.log_softmax(delta_logits, dim=2) # [B,64,73]
+        log_p_delta = torch.log_softmax(delta_logits, dim=2) # [B,64,64]
 
         # Optional temperature transform on targets (alpha<1 = smoothing)
         with torch.no_grad():
             PF_tgt = _sharpen_probs(PF, alpha=sharpen_alpha)  # [B,64]
-            PD_tgt = _sharpen_probs(PD, alpha=sharpen_alpha)  # [B,64,73]
+            PD_tgt = _sharpen_probs(PD, alpha=sharpen_alpha)  # [B,64,64]
 
         # From-square CE: -(PF · log p_from)
         loss_from = -(PF_tgt * log_p_from).sum(dim=1)         # [B]
@@ -205,7 +205,7 @@ if __name__ == "__main__":
         dataset,
         batch_size=256,
         shuffle=True,
-        num_workers=0,                      # set >0 for throughput if disk/CPU allow
+        num_workers=0,
         pin_memory=(device == "cuda"),
         persistent_workers=False
     )
